@@ -1,0 +1,40 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const entries={};
+const node=()=>({innerHTML:'',textContent:'',value:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},focus(){},setAttribute(){},scrollIntoView(){},isConnected:true});
+['#sidebar','#topbar','#main','#toast','#overlay-root','#mobile-shade','#knowledge-graph','#graph-layer','#graph-detail','#answer-area'].forEach(s=>entries[s]=node());
+const events={},storage=new Map();
+let failureStore=false,selection=[];
+const ctx={console,Intl,Date,Math,URL,Blob,setTimeout:fn=>{queueMicrotask(fn);return 1},clearTimeout(){},queueMicrotask,window:{addEventListener:(n,fn)=>events[n]=fn,scrollTo(){}},document:{querySelector:s=>entries[s]||null,querySelectorAll:s=>selection,addEventListener(){},body:{style:{}},activeElement:node()},location:{hash:''},localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>{if(failureStore)throw Error('quota');storage.set(k,v)}}};
+vm.createContext(ctx);vm.runInContext(fs.readFileSync('dist/data.js','utf8'),ctx);
+let app=fs.readFileSync('dist/app.js','utf8');
+app=app.replace(/\}\)\(\);\s*$/,`globalThis.TEST={get db(){return db},validData,markdown,rank,issues,edges,makeAnswer,act,openModal,closeModal,persist,get modal(){return modal},get answer(){return answer},set answer(v){answer=v},render,readRoute};})();`);
+vm.runInContext(app,ctx);const t=ctx.TEST;
+const run=async(a,d={})=>t.act({dataset:{action:a,...d}},{target:{}});
+const field=(id,value)=>{entries['#'+id]=node();entries['#'+id].value=value};
+const tests=[];function check(name,fn){fn();tests.push(name)}
+async function main(){
+ check('Seed schema, unique IDs and reference integrity',()=>{assert(t.validData(t.db));t.db.pages.forEach(p=>{p.links.forEach(id=>assert(t.db.pages.some(x=>x.id===id)));p.sources.forEach(id=>assert(t.db.sources.some(x=>x.id===id)))});assert.equal(t.db.pages.length,12);assert.equal(t.db.sources.length,8)});
+ check('All seven page routes render without errors',()=>{for(const r of ['home','library','sources','graph','ask','health','settings','page/p1']){ctx.location.hash='#'+r;t.readRoute();assert(entries['#main'].innerHTML.length>500)}});
+ check('Markdown escapes HTML and resolves knowledge links',()=>{const m=t.markdown('<img src=x onerror=alert(1)>\n\n[[第二大脑]]\n\n**重点**');assert(!m.includes('<img'));assert(m.includes('&lt;img'));assert(m.includes('data-id="p2"'));assert(m.includes('<strong>重点</strong>'))});
+ check('Question retrieval has relevant citations and empty response',()=>{const a=t.makeAnswer('RAG 和 LLM Wiki 有什么区别？');assert(a.pages.some(p=>p.id==='p5'));assert(a.content.includes('持续'));assert.equal(t.makeAnswer('火星种植土壤技术').pages.length,0)});
+ check('Health flags missing source instead of inventing fact judgments',()=>{assert(t.issues().some(x=>x.type==='source'&&x.p.id==='p12'));assert(t.edges().length>10)});
+ const baseSources=t.db.sources.length;t.openModal('add',{mode:'note'});field('source-title','测试阅读资料');field('source-content','用自己的语言写笔记。知识管理需要双向链接。');field('source-tags','阅读, 知识管理');field('source-author','QA');
+ await run('save-source');check('Import persists raw source without changing original body',()=>{assert.equal(t.db.sources.length,baseSources+1);assert.equal(t.db.sources[0].status,'raw');assert.equal(t.db.sources[0].content,'用自己的语言写笔记。知识管理需要双向链接。');assert(storage.has('mindgarden.v1'))});
+ const raw=t.db.sources[0],n=t.db.pages.length;await run('compile',{id:raw.id});field('compile-title','测试编译知识');selection=[{value:'p2'}];await run('confirm-compile');selection=[];
+ check('Compile creates wiki, marks source, links source and related wiki',()=>{assert.equal(t.db.pages.length,n+1);const p=t.db.pages[0];assert(p.sources.includes(raw.id));assert(p.links.includes('p2'));assert.equal(raw.status,'compiled');assert(t.db.pages.find(p=>p.id==='p2').links.includes(p.id));assert(t.db.pages.find(p=>p.id==='p2').sources.includes(raw.id));assert.equal(raw.content,'用自己的语言写笔记。知识管理需要双向链接。')});
+ const id=t.db.pages[0].id;await run('edit-page',{id});field('edit-title','测试编译知识 · 已编辑');field('edit-subtitle','编辑后保留');field('edit-content','# 测试\n\n[[双向链接]]\n\n**自己的理解**');field('edit-category','知识管理');field('edit-tags','实践, 写作');await run('save-page');
+ check('Edit saves content, resolves links, retains raw citation',()=>{const p=t.db.pages.find(p=>p.id===id);assert(p.content.includes('自己的理解'));assert(p.links.includes('p3'));assert(p.sources.includes(raw.id));assert.equal(p.title,'测试编译知识 · 已编辑')});
+ await run('star',{id});check('Favorite toggles and persists',()=>assert(t.db.pages.find(p=>p.id===id).star));
+ t.answer=t.makeAnswer('如何把阅读转化为输出？');await run('save-answer');check('Save answer creates durable wiki with citations and avoids double save',()=>{assert(t.answer.saved);assert.equal(t.db.pages[0].kind,'探索');assert(t.db.pages[0].sources.length>0);assert(t.db.pages[0].links.length>0)});
+ const count=t.db.pages.length;await run('save-answer');assert.equal(t.db.pages.length,count);
+ await run('fix-issue',{id:'p12',type:'source'});selection=[{value:'s6'}];await run('save-fix');selection=[];
+ check('Maintenance source linking resolves the detected issue',()=>{assert(t.db.pages.find(p=>p.id==='p12').sources.includes('s6'));assert(!t.issues().some(x=>x.type==='source'&&x.p.id==='p12'))});
+ check('Reject invalid backup date and injection-bearing IDs',()=>{let d=JSON.parse(JSON.stringify(t.db));d.pages[0].date='<script>';assert(!t.validData(d));d=JSON.parse(JSON.stringify(t.db));d.pages[0].id='x|y';assert(!t.validData(d));assert(t.validData(JSON.parse(storage.get('mindgarden.v1'))))});
+ check('Storage failure rolls mutation back',()=>{const old=t.db.pages.length;t.db.pages.push({...t.db.pages[0],id:'testquota'});failureStore=true;assert.equal(t.persist(),false);failureStore=false;assert.equal(t.db.pages.length,old)});
+ await run('delete-confirm',{id});await run('do-confirm');check('Delete cleans graph references but preserves raw source',()=>{assert(!t.db.pages.some(p=>p.id===id));assert(t.db.pages.every(p=>!p.links.includes(id)));assert(t.db.sources.some(s=>s.id===raw.id))});
+ const backup=JSON.parse(storage.get('mindgarden.v1'));t.openModal('restore',{data:backup});await run('restore-data');
+ check('Backup restore preserves pages, sources and references',()=>{assert(t.validData(t.db));assert.equal(t.db.pages.length,backup.pages.length);assert.equal(t.db.sources.length,backup.sources.length)});
+ await run('reset-confirm');await run('do-confirm');check('Demo reset restores original dataset',()=>{assert.equal(t.db.pages.length,12);assert.equal(t.db.sources.length,8);assert.equal(t.db.pages.find(p=>p.id==='p12').sources.length,0)});
+ console.log(JSON.stringify({passed:tests.length,tests,limits:['DOM logic tested in isolated VM, not a browser','Desktop/mobile visual verification unavailable','Cloud publication blocked by terminal approval policy']},null,2));
+}
+main().catch(e=>{console.error(e.stack);process.exitCode=1});
